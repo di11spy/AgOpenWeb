@@ -20,6 +20,7 @@ using AgOpenWeb.Models.Timing;
 using AgOpenWeb.Models.YouTurn;
 using AgOpenWeb.Services;
 using AgOpenWeb.Services.Fields;
+using AgOpenWeb.Services.Kml;
 using AgOpenWeb.Services.YouTurn;
 using AgOpenWeb.Services.Interfaces;
 using AgOpenWeb.Models.GPS;
@@ -5079,20 +5080,7 @@ public partial class MainViewModel : ObservableObject
     /// </summary>
     /// <summary>Text of a KML file, or of the KML inside a KMZ (a zip — usually doc.kml).
     /// KMZ files were listed but read as raw zip bytes, so nothing parsed (#111).</summary>
-    internal static TextReader OpenKmlText(string filePath)
-    {
-        if (!filePath.EndsWith(".kmz", StringComparison.OrdinalIgnoreCase))
-            return new StreamReader(filePath);
-
-        var zip = System.IO.Compression.ZipFile.OpenRead(filePath);
-        var entry = zip.Entries.FirstOrDefault(e => string.Equals(e.Name, "doc.kml", StringComparison.OrdinalIgnoreCase))
-                    ?? zip.Entries.FirstOrDefault(e => e.Name.EndsWith(".kml", StringComparison.OrdinalIgnoreCase));
-        if (entry == null) { zip.Dispose(); return new StringReader(string.Empty); }
-        // Read it all so the zip can close now.
-        using (zip)
-        using (var r = new StreamReader(entry.Open()))
-            return new StringReader(r.ReadToEnd());
-    }
+    internal static TextReader OpenKmlText(string filePath) => KmlGeometryReader.OpenText(filePath);
 
     private void ParseKmlFile(string filePath)
     {
@@ -5102,87 +5090,21 @@ public partial class MainViewModel : ObservableObject
         KmlCenterLatitude = 0;
         KmlCenterLongitude = 0;
 
-        try
+        // Every <coordinates> block, wherever the lines break. The reader lives in
+        // KmlGeometryReader so the farm-office import uses the same rules.
+        var parsed = KmlGeometryReader.Read(filePath);
+        if (parsed.Error != null)
         {
-            using var reader = OpenKmlText(filePath);
-            double sumLat = 0, sumLon = 0;
-            int totalValidPoints = 0;
-
-            // Every <coordinates> block, wherever the lines break. GDAL's KML driver (so a
-            // QGIS export) writes a whole polygon on one line, outer ring and holes together,
-            // and reading only the first block of each line kept the outer ring and lost
-            // every hole.
-            const string Open = "<coordinates>", Close = "</coordinates>";
-            string text = reader.ReadToEnd();
-            int at = 0;
-            while ((at = text.IndexOf(Open, at, StringComparison.Ordinal)) != -1)
-            {
-                int start = at + Open.Length;
-                int end = text.IndexOf(Close, start, StringComparison.Ordinal);
-                if (end == -1) break;
-                at = end + Close.Length;
-                string coordinates = text.Substring(start, end - start);
-
-                // Parse coordinate pairs: format is "lon,lat,alt lon,lat,alt ..."
-                char[] delimiterChars = { ' ', '\t', '\r', '\n' };
-                string[] numberSets = coordinates.Split(delimiterChars, StringSplitOptions.RemoveEmptyEntries);
-
-                if (numberSets.Length >= 3)
-                {
-                    var polygonPoints = new List<(double Latitude, double Longitude)>();
-
-                    foreach (string item in numberSets)
-                    {
-                        if (item.Length < 3) continue;
-
-                        string[] parts = item.Split(',');
-                        if (parts.Length >= 2 &&
-                            double.TryParse(parts[0], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double lon) &&
-                            double.TryParse(parts[1], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double lat))
-                        {
-                            polygonPoints.Add((lat, lon));
-                            sumLat += lat;
-                            sumLon += lon;
-                            totalValidPoints++;
-                        }
-                    }
-
-                    // A KML ring repeats its first point at the end; a boundary doesn't (AgOpenGPS
-                    // FixFenceLine drops points that close together), so drop it here.
-                    if (polygonPoints.Count >= 4 && polygonPoints[0] == polygonPoints[^1])
-                    {
-                        sumLat -= polygonPoints[^1].Latitude;
-                        sumLon -= polygonPoints[^1].Longitude;
-                        totalValidPoints--;
-                        polygonPoints.RemoveAt(polygonPoints.Count - 1);
-                    }
-
-                    if (polygonPoints.Count >= 3)
-                    {
-                        _kmlParsedPolygons.Add(polygonPoints);
-
-                        // First polygon also populates _kmlBoundaryPoints for backwards compatibility
-                        if (_kmlParsedPolygons.Count == 1)
-                        {
-                            _kmlBoundaryPoints.AddRange(polygonPoints);
-                        }
-                    }
-                }
-                // Continue to parse additional coordinate blocks (inner boundaries)
-            }
-
-            if (totalValidPoints > 0)
-            {
-                KmlCenterLatitude = sumLat / totalValidPoints;
-                KmlCenterLongitude = sumLon / totalValidPoints;
-            }
-
-            KmlBoundaryPointCount = totalValidPoints;
+            ReportFailure($"Error parsing KML: {parsed.Error}");
+            return;
         }
-        catch (Exception ex)
-        {
-            ReportFailure($"Error parsing KML: {ex.Message}");
-        }
+
+        _kmlParsedPolygons.AddRange(parsed.Polygons);
+        if (parsed.Polygons.Count > 0)
+            _kmlBoundaryPoints.AddRange(parsed.Polygons[0]);
+        KmlCenterLatitude = parsed.CenterLatitude;
+        KmlCenterLongitude = parsed.CenterLongitude;
+        KmlBoundaryPointCount = parsed.PointCount;
     }
 
     /// <summary>

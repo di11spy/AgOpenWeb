@@ -16,9 +16,12 @@
 using System.Collections.Concurrent;
 using System.Reflection;
 using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
 using SkiaSharp;
 using AgOpenWeb.Models.State;
 using AgOpenWeb.Services;
+using AgOpenWeb.Services.Farm;
 using AgOpenWeb.Services.Interfaces;
 
 namespace AgOpenWeb.RemoteServer;
@@ -448,9 +451,65 @@ public sealed class RemoteServerHost
                 (AgOpenWeb.Services.BugReport.BugReportAttachments.Refusal.None,
                  AgOpenWeb.Services.BugReport.BugReportAttachments.Remove(path, name)))));
 
+        MapFarmOffice(server, state, autoSteer);
+
         await server.StartAsync().ConfigureAwait(false);
         _broadcaster.Start();
         _server = server;
+    }
+
+    /// <summary>
+    /// Farm office pages and JSON. The live sample is a one-hertz read of state the
+    /// guidance host already published. It is taken when a browser asks for the
+    /// snapshot, not inside the 100 Hz loop, and it does not send a PGN.
+    /// </summary>
+    private static void MapFarmOffice(SimpleWebServer server, ApplicationState state, IAutoSteerService autoSteer)
+    {
+        var noStore = new[] { ("Cache-Control", "no-store") };
+        FarmOffice.UseLiveFix(() =>
+        {
+            var vehicle = state.Vehicle;
+            if (Math.Abs(vehicle.Latitude) < 0.01 && Math.Abs(vehicle.Longitude) < 0.01)
+                return null;
+            double? steer = null;
+            if (autoSteer.LastSteerDataUtc != DateTime.MinValue)
+                steer = autoSteer.LastSteerData.ActualSteerAngle;
+            return new FarmOffice.LiveFix
+            {
+                Latitude = vehicle.Latitude,
+                Longitude = vehicle.Longitude,
+                HeadingDegrees = vehicle.Heading,
+                HostSpeed = vehicle.Speed,
+                Pgn250SensorPercent = autoSteer.SensorPercent,
+                Pgn253SteerAngleDeg = steer,
+                Pgn211RollDegrees = vehicle.Roll,
+            };
+        });
+
+        SimpleWebServer.Response Page() =>
+            SimpleWebServer.Response.Text(ReadAsset("farm.index.html"), "text/html", noStore);
+        server.MapGet("/farm", Page);
+        server.MapGet("/farm/", Page);
+        server.MapGet("/farm/api/snapshot", () =>
+            SimpleWebServer.Response.Text(JsonSerializer.Serialize(FarmOffice.View(), FarmStore.Options), "application/json", noStore));
+        server.MapGetPrefix("/farm/", file =>
+        {
+            if (file.Contains('/') || file.Contains('\\') || file.Contains(".."))
+                return SimpleWebServer.Response.NotFound;
+            var asset = file.Equals("farm.js", StringComparison.OrdinalIgnoreCase) ? "farm.farm.js"
+                : file.Equals("farm.css", StringComparison.OrdinalIgnoreCase) ? "farm.farm.css"
+                : null;
+            if (asset == null) return SimpleWebServer.Response.NotFound;
+            var type = asset.EndsWith(".css", StringComparison.Ordinal) ? "text/css" : "text/javascript";
+            try { return SimpleWebServer.Response.Text(ReadAsset(asset), type, noStore); }
+            catch (FileNotFoundException) { return SimpleWebServer.Response.NotFound; }
+        });
+        server.MapPost("/farm/api/act", 2_000_000, req =>
+        {
+            var (status, body) = FarmOffice.Act(Encoding.UTF8.GetString(req.Body));
+            var json = JsonSerializer.Serialize(body, FarmStore.Options);
+            return Task.FromResult(new SimpleWebServer.Response(status, "application/json", Encoding.UTF8.GetBytes(json), noStore));
+        });
     }
 
     // A bug report the app wrote: filename only (no path traversal), bugreport_*.zip, present.
