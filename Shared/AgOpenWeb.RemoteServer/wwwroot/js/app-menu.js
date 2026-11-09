@@ -9,7 +9,7 @@
 // hotkeys/bug-report). Sub-panels are chain panels (replace the menu; Back reopens it).
 document.getElementById('ln-filemenu').addEventListener('pointerdown', e => {
   e.stopPropagation();
-  const anyOpen = ['filemenu', 'appsettings', 'language', 'viewsettings', 'logviewer', 'hotkeys', 'help', 'about', 'bugreport'].some(id => document.getElementById(id).classList.contains('open'));
+  const anyOpen = ['filemenu', 'appsettings', 'language', 'viewsettings', 'logviewer', 'hotkeys', 'help', 'about', 'bugreport', 'farmpeek'].some(id => document.getElementById(id).classList.contains('open'));
   if (anyOpen) lnCloseAll(); else lnOpen('filemenu', 'ln-filemenu');
 });
 for (const b of document.querySelectorAll('.fm-back'))
@@ -24,6 +24,57 @@ document.getElementById('fm-simulator').addEventListener('pointerdown', e => { e
 document.getElementById('fm-help').addEventListener('pointerdown', e => { e.stopPropagation(); lnOpen('help', 'ln-filemenu'); });
 document.getElementById('fm-about').addEventListener('pointerdown', e => { e.stopPropagation(); lnOpen('about', 'ln-filemenu', renderAbout); });
 document.getElementById('fm-bugreport').addEventListener('pointerdown', e => { e.stopPropagation(); lnOpen('bugreport', 'ln-filemenu', renderBugReport); });
+document.getElementById('fm-farmpeek').addEventListener('pointerdown', e => { e.stopPropagation(); lnOpen('farmpeek', 'ln-filemenu', renderFarmPeek); });
+document.getElementById('fm-farmoffice').addEventListener('pointerdown', e => { e.stopPropagation(); location.href = '/farm/'; });
+document.getElementById('fm-farmoffice2').addEventListener('pointerdown', e => { e.stopPropagation(); location.href = '/farm/'; });
+
+// Farm summary in the cab. The numbers come from the farm office API. While this
+// panel is open, the published status-frame fix is posted once a second as a
+// read-only log. It does not send a steer, rate, or section command.
+function renderFarmPeek() {
+  const safety = document.getElementById('farmpeek-safety');
+  const body = document.getElementById('farmpeek-body');
+  body.textContent = tr('Loading…');
+  fetch('/farm/api/snapshot', { cache: 'no-store' }).then(r => r.json()).then(snap => {
+    if (!document.getElementById('farmpeek').classList.contains('open')) return;
+    safety.textContent = snap.safetyBanner || '';
+    body.textContent = '';
+    const s = snap.summary || {};
+    const lines = [
+      tr('Online {n}', { n: s.online }) + ', ' + tr('stale {n}', { n: s.stale }) + ', ' + tr('offline {n}', { n: s.offline }),
+      tr('Marketable grain {kg} kg dry', { kg: Math.round(s.marketableDryKg || 0) }),
+      tr('Yield map {kg} kg dry', { kg: Math.round(s.yieldDryKg || 0) }),
+      tr('Trucks coming {a}, going {b}, en route {c}', { a: s.trucksComing, b: s.trucksGoing, c: s.trucksEnroute }),
+    ];
+    for (const line of lines) {
+      const p = document.createElement('div');
+      p.className = 'sa-hint';
+      p.textContent = line;
+      body.appendChild(p);
+    }
+  }).catch(() => { body.textContent = tr('Farm office is not answering'); });
+}
+setInterval(() => {
+  const panel = document.getElementById('farmpeek');
+  if (!panel || !panel.classList.contains('open') || !statusBar) return;
+  if (!statusBar.lat && !statusBar.lon) return;
+  const pose = (typeof tick !== 'undefined' && tick && tick.pose) ? tick.pose : null;
+  fetch('/farm/api/act', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      op: 'ingest-observation',
+      source: 'cab-status-frame',
+      kind: 'observation',
+      latitude: statusBar.lat,
+      longitude: statusBar.lon,
+      hostSpeed: pose ? pose.speed : null,
+      headingDegrees: pose ? pose.heading * 180 / Math.PI : null,
+      pgn250SensorPercent: statusBar.sensorPercent,
+      pgn253SteerAngleDeg: statusBar.actualSteerAngle,
+    }),
+  }).catch(() => {});
+}, 1000);
 
 // App Settings: units (status) + device toggles (config.display) + app directories (appInfo).
 function renderAppSettings() {
